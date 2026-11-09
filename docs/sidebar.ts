@@ -51,6 +51,7 @@ export const sidebar = [
     text: 'Reference',
     items: [
       { text: 'Configuration', link: '/reference/configuration' },
+      { text: 'Image publishing and registries', link: '/reference/image-publishing' },
       { text: 'Tool Directory', link: '/reference/tool-directory' },
     ],
   },

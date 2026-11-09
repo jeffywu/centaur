@@ -1,0 +1,225 @@
+---
+title: Image publishing and registries
+description: Configure public image repositories, image publication, local builds, and published-image E2E tests without changing workflow logic.
+---
+
+# Image publishing and registries
+
+All options below are additive. Leaving them unset preserves the existing GHCR
+repositories, OCI source metadata, Depot builders and runners, event-dependent
+platforms and Rust profiles, tags, local image names, and downstream notification.
+This MVP targets publicly readable image repositories. Publishing needs push
+credentials, while Kubernetes and E2E pull images anonymously. Runtime Rust and
+Helm chart behavior are unchanged.
+
+Forks must explicitly select their own destinations; these are not inferred from
+the GitHub repository owner.
+
+## Configure GitHub Actions
+
+In your fork, open **Settings → Secrets and variables → Actions**. Add non-secret
+configuration under **Variables**, and credentials under **Secrets**. Organization
+variables and secrets can also be used where repository access permits them.
+
+`publish-images.yml` runs on its existing events and also supports `workflow_call`.
+Reusable inputs take precedence over repository variables, then the existing
+values are used. Input names are the lowercase variable names without `CENTAUR_`:
+for example, `CENTAUR_IMAGE_NAMESPACE` becomes `image_namespace`. All inputs are
+strings; use the string `"false"` to disable dispatch and a JSON string for the platform list.
+Pass publishing secrets explicitly from a reusable workflow caller.
+
+### Fork publishing to GHCR
+
+Set these repository variables:
+
+```text
+CENTAUR_REGISTRY=ghcr.io
+CENTAUR_IMAGE_NAMESPACE=your-org/your-fork
+CENTAUR_IMAGE_SOURCE_URL=https://github.com/your-org/your-fork
+CENTAUR_BUILD_BACKEND=buildx
+CENTAUR_BUILD_PLATFORMS=["linux/amd64","linux/arm64"]
+CENTAUR_BUILD_RUNNER_AMD64=ubuntu-24.04
+CENTAUR_BUILD_RUNNER_ARM64=ubuntu-24.04-arm
+CENTAUR_MANIFEST_RUNNER=ubuntu-24.04
+CENTAUR_E2E_RUNNER=ubuntu-24.04
+CENTAUR_DISPATCH_ENABLED=false
+```
+
+No registry secret is needed for the default GHCR path: publishing jobs use
+`github.actor` and the automatically supplied `GITHUB_TOKEN`, with `packages: write`.
+Make sure the selected package namespace permits the repository to publish.
+Make each image package publicly readable in your registry settings; the workflow
+does not change package visibility.
+These runner overrides affect publishing and E2E; other CI workflows retain their
+own runner settings. Selecting Buildx alone does not change runner defaults.
+Runner overrides accept one label, such as `ubuntu-24.04`; JSON arrays of
+runner labels are not supported. Native runners must match each selected platform; this workflow does not install
+QEMU. Single-architecture clusters can select only their required platform.
+
+### Custom public registry
+
+Use the same builder and runner overrides, then replace the destination and
+publishing authentication:
+
+```text
+CENTAUR_REGISTRY=registry.example.com:5000
+CENTAUR_IMAGE_NAMESPACE=platform/agents
+```
+
+Create Actions secrets `CENTAUR_REGISTRY_USERNAME` and
+`CENTAUR_REGISTRY_PASSWORD` (a registry token can be the password). Scope the
+identity to push and pull the selected namespace, including manifest publication.
+Configure those repositories to allow anonymous pulls. Public readability does
+not grant anonymous push access.
+Use `CENTAUR_IMAGE_SOURCE_URL` to identify your fork. Hostnames and namespaces
+are normalized to lowercase; supply no URL scheme or trailing slash.
+
+The existing `docker/login-action` step consumes the configured token directly.
+When no token override is supplied, it uses `GITHUB_TOKEN` only for `ghcr.io`;
+other registries require an explicit token. The username defaults to
+`github.actor` unless overridden. Tokens can be provider-issued access tokens;
+automatically issuing or refreshing cloud tokens is outside this MVP. There is
+no custom login action, authentication-mode setting, or credential-helper layer.
+
+### Publishing options
+
+| Repository variable | Default | Purpose |
+| --- | --- | --- |
+| `CENTAUR_REGISTRY` | `ghcr.io` | Image registry, including optional port. |
+| `CENTAUR_IMAGE_NAMESPACE` | `paradigmxyz/centaur` | Repository path below the registry. |
+| `CENTAUR_IMAGE_SOURCE_URL` | `https://github.com/paradigmxyz/centaur` | OCI source label. |
+| `CENTAUR_BUILD_BACKEND` | `depot` | `depot` or `buildx`. |
+| `CENTAUR_DEPOT_PROJECT` | Existing project in `publish-images.yml` | Override with your authorized Depot project when using Depot. |
+| `CENTAUR_BUILD_PLATFORMS` | `["linux/amd64","linux/arm64"]` on pushes; `["linux/amd64"]` otherwise | Nonempty JSON array of unique supported platforms. |
+| `CENTAUR_BUILD_RUNNER_AMD64` | `depot-ubuntu-24.04-16` | Single amd64 runner label. |
+| `CENTAUR_BUILD_RUNNER_ARM64` | `depot-ubuntu-24.04-arm-16` | Single arm64 runner label. |
+| `CENTAUR_MANIFEST_RUNNER` | `depot-ubuntu-24.04` | Manifest job runner; also used by image-configuration CI checks. |
+| `CENTAUR_E2E_RUNNER` | `depot-ubuntu-24.04-16` | Published-image E2E runner. |
+| `CENTAUR_RUST_BUILD_PROFILE` | `debug` for PR/manual events, `release` otherwise | Explicit `debug` or `release` override. |
+| `CENTAUR_DISPATCH_ENABLED` | `true` | `false` disables notification. Existing push-to-main conditions still apply. |
+| `CENTAUR_DISPATCH_REPOSITORY` | Existing downstream repository in `publish-images.yml` | Notification target (`owner/repository`). |
+| `CENTAUR_DISPATCH_EVENT_TYPE` | Existing event type in `publish-images.yml` | Repository dispatch event type. |
+| `CENTAUR_DISPATCH_ENVIRONMENT` | Existing notification environment in `publish-images.yml` | GitHub environment for the notification job. |
+| `CENTAUR_DISPATCH_RUNNER` | `depot-ubuntu-24.04` | Notification job runner. |
+
+Depot requires access to the configured project and runners, with its existing
+OIDC authentication. These credentials are unnecessary for Buildx. Fork PRs still
+skip image publishing and never receive publishing credentials.
+
+Image basenames and tag rules are unchanged. All 12 images use the selected
+registry/namespace, including optional services. Workflow-host code remains
+embedded in the API and agent images. Trigger policy remains in the caller;
+image publication does not deploy to a production cluster.
+
+### Optional downstream notification
+
+An enabled notification uses `CENTAUR_DISPATCH_TOKEN`, falling back to the existing
+`CENTAUR_PARADIGM_DISPATCH_TOKEN`. Give the replacement token permission to send
+repository dispatches to your configured downstream repository. Set
+`CENTAUR_DISPATCH_ENABLED=false` if no notification is needed. No dispatch token
+is required when disabled. Publication notification retains its existing dependency
+on manifest publication; it does not wait for E2E and is not a deployment gate.
+
+## Local build and push
+
+Local defaults remain bare `centaur-*:latest` images. To build and push to a
+registry, export the same destination settings in your shell:
+
+```bash
+export CENTAUR_IMAGE_SOURCE=registry
+export CENTAUR_REGISTRY=registry.example.com:5000
+export CENTAUR_IMAGE_NAMESPACE=platform/agents
+export CENTAUR_IMAGE_TAG=dev-123
+
+# Authenticate using your normal Docker credential store or password-stdin.
+docker login "$CENTAUR_REGISTRY"
+just build
+just push
+```
+
+`just build-one api-rs` builds one component with the same naming rules.
+`CENTAUR_IMAGE_TAG` defaults to `latest`; it applies to the generic registry path,
+not CI's tag generation. Docker build architecture remains the host default.
+
+`CENTAUR_AGENT_IMAGE`, `CENTAUR_AGENT_DOCKERFILE`, and
+`CENTAUR_AGENT_BUILD_TARGET` retain their existing defaults. An explicitly set
+agent image wins for the agent build; `just push` tags that source image into the
+configured registry destination. Both legacy k3s push/import helpers now also
+honor a customized agent image. `CENTAUR_LOCAL_REGISTRY` retains its existing
+`localhost:5000` default and `/library/` k3s mirror convention; it is independent
+of `CENTAUR_REGISTRY`.
+
+## Select images in Helm
+
+For the development helper, `CENTAUR_IMAGE_SOURCE=registry just deploy` selects
+all configured repositories and `CENTAUR_IMAGE_TAG`. Existing `local` and `ghcr`
+source modes keep their defaults. The shared registry and namespace variables can
+also override the `ghcr` destination without changing its tag behavior.
+
+`CENTAUR_EXTRA_VALUES` remains an optional file layered after development values.
+Existing precedence is preserved: generated image `--set-string` arguments beat
+values files. To supply independent image selections through that file, use
+`CENTAUR_IMAGE_SOURCE=local`, or call Helm directly with your own values.
+
+All existing `<component>.image.repository`, `.tag`, and `.pullPolicy` values remain
+available. `toolServer.runnerImage` and `repoCache.image` still fall back to the
+sandbox image. Controller and PostgreSQL images retain independent settings under
+`agentSandbox.image` and `postgres.image`; changing the application registry does
+not implicitly relocate third-party images. Mirror and override those explicitly
+if required. Dockerfile base-image sources are unchanged.
+
+## Published-image E2E
+
+The publishing workflow passes the selected registry, namespace, and runner into
+`e2e.yml`. That workflow also accepts `registry`, `image_namespace`, `runner`, and
+the existing `image_tag` as manual/reusable inputs. All published-image E2E pulls
+are anonymous, including the agent pre-pull. The existing default tag is
+`sha-<short head SHA>`. There are no registry credential inputs for E2E.
+
+For local published-image tests:
+
+```bash
+export CENTAUR_REGISTRY=registry.example.com:5000
+export CENTAUR_IMAGE_NAMESPACE=platform/agents
+export CENTAUR_E2E_IMAGE_TAG=dev-123
+e2e/stack.sh up
+e2e/stack.sh test
+```
+
+The stack uses its own kubeconfig and pulls the selected images directly. No
+registry credential export, image-pull Secret provisioning, or runtime pod-builder
+changes are included in this MVP. Existing private-image settings are unchanged.
+
+For plain HTTP local registries or registries with a custom CA, configure trust
+and routing in Docker, Buildx, and the kind nodes separately. Image-name overrides
+do not disable TLS verification or install registry trust.
+
+## Local validation
+
+Run configuration and Helm wiring checks with:
+
+```bash
+uv run --no-project --with pyyaml==6.0.3 python -m unittest discover -s scripts -p test_image_config.py -v
+helm lint contrib/chart
+```
+
+`scripts/smoke_image_registry.sh` creates an anonymous loopback registry, an
+isolated Buildx builder, and a disposable kind cluster with its own kubeconfig.
+It publishes amd64/arm64 fixture images by digest, assembles their manifest using
+the workflow's merge script, checks the E2E-style agent pre-pull, and verifies a
+Pod can pull and run the selected image without a pull Secret. Small shell
+fixture images isolate registry behavior from application startup; this smoke
+does not run a full chat session.
+
+Install Docker/Buildx, kind, kubectl, jq, and curl, then run:
+
+```bash
+scripts/smoke_image_registry.sh
+```
+
+The test needs no credentials and cleans up its cluster, builder, registry
+container, and temporary Docker configuration. It uses port `5051`; override
+`CENTAUR_REGISTRY_SMOKE_PORT` if that port is occupied. GitHub Actions, provider
+federation, Depot, and repository dispatch require separate remote integration
+checks. Private image pulls and new Kubernetes registry-authentication features
+are outside this MVP.

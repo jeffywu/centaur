@@ -15,6 +15,9 @@ on:
       - packages/**
       - tools/**
       - workflows/**
+      - contrib/scripts/image-config.sh
+      - .github/scripts/configure-images.sh
+      - .github/scripts/merge-images.sh
       - scripts/bootstrap-k8s-secrets.sh
       - package.json
       - pnpm-lock.yaml
@@ -22,6 +25,81 @@ on:
       - .agents/skills/**
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      registry:
+        description: Registry hostname, optionally including a port
+        type: string
+        default: ""
+      image_namespace:
+        description: Image repository namespace
+        type: string
+        default: ""
+      image_source_url:
+        description: OCI source URL
+        type: string
+        default: ""
+      build_backend:
+        description: depot or buildx
+        type: string
+        default: ""
+      depot_project:
+        description: Depot project ID
+        type: string
+        default: ""
+      build_platforms:
+        description: JSON array of platforms; empty preserves event-based defaults
+        type: string
+        default: ""
+      build_runner_amd64:
+        description: amd64 runner label
+        type: string
+        default: ""
+      build_runner_arm64:
+        description: arm64 runner label
+        type: string
+        default: ""
+      manifest_runner:
+        description: Manifest runner label
+        type: string
+        default: ""
+      e2e_runner:
+        description: E2E runner label
+        type: string
+        default: ""
+      rust_build_profile:
+        description: Rust profile; empty preserves event-based defaults
+        type: string
+        default: ""
+      dispatch_enabled:
+        description: Set false to disable downstream notification
+        type: string
+        default: ""
+      dispatch_repository:
+        description: Downstream notification repository
+        type: string
+        default: ""
+      dispatch_event_type:
+        description: Repository dispatch event type
+        type: string
+        default: ""
+      dispatch_environment:
+        description: Notification GitHub environment
+        type: string
+        default: ""
+      dispatch_runner:
+        description: Notification runner label
+        type: string
+        default: ""
+    secrets:
+      CENTAUR_REGISTRY_USERNAME:
+        required: false
+      CENTAUR_REGISTRY_PASSWORD:
+        required: false
+      CENTAUR_DISPATCH_TOKEN:
+        required: false
+      CENTAUR_PARADIGM_DISPATCH_TOKEN:
+        required: false
 
 concurrency:
   group: publish-images-${{ github.ref }}
@@ -33,28 +111,33 @@ permissions:
   packages: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: paradigmxyz/centaur
-  IMAGE_SOURCE: https://github.com/paradigmxyz/centaur
+  CENTAUR_REGISTRY: ${{ inputs.registry || vars.CENTAUR_REGISTRY || 'ghcr.io' }}
+  CENTAUR_IMAGE_NAMESPACE: ${{ inputs.image_namespace || vars.CENTAUR_IMAGE_NAMESPACE || 'paradigmxyz/centaur' }}
+  IMAGE_SOURCE: ${{ inputs.image_source_url || vars.CENTAUR_IMAGE_SOURCE_URL || 'https://github.com/paradigmxyz/centaur' }}
+  CENTAUR_BUILD_PLATFORMS: ${{ inputs.build_platforms || vars.CENTAUR_BUILD_PLATFORMS }}
+  BUILD_BACKEND: ${{ inputs.build_backend || vars.CENTAUR_BUILD_BACKEND || 'depot' }}
   # Main/tags keep optimized release images. PRs and manual branch publishes
   # use debug builds so staging/dev iteration does not spend minutes optimizing
   # Rust binaries that are immediately replaced by the next test build.
-  RUST_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && 'debug' || 'release' }}
+  RUST_BUILD_PROFILE: ${{ inputs.rust_build_profile || vars.CENTAUR_RUST_BUILD_PROFILE || (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && 'debug' || 'release' }}
 
 jobs:
-  # Build each image with Depot's hosted builders, push by digest, and hand
+  # Build each image (Depot by default), push by digest, and hand
   # the digests to the merge job below which assembles the multi-arch manifest.
-  # arm64 is only built on pushes to main and release tags — PR and manual
+  # By default, arm64 is only built on pushes to main and release tags — PR and manual
   # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip both
   # jobs so untrusted changes do not run on the hosted image builders.
   build:
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
+    runs-on: >-
+      ${{ matrix.platform == 'linux/arm64' &&
+          (inputs.build_runner_arm64 || vars.CENTAUR_BUILD_RUNNER_ARM64 || 'depot-ubuntu-24.04-arm-16') ||
+          (inputs.build_runner_amd64 || vars.CENTAUR_BUILD_RUNNER_AMD64 || 'depot-ubuntu-24.04-16') }}
     strategy:
       fail-fast: false
       matrix:
         service: [api-rs, company-context, proxy-sync, token-broker, slackbotv2, linearbot, discordbot, githubbot, teamsbot, agent, iron-proxy, console]
-        platform: ${{ github.event_name == 'push' && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
+        platform: ${{ (inputs.build_platforms || vars.CENTAUR_BUILD_PLATFORMS) && fromJSON(inputs.build_platforms || vars.CENTAUR_BUILD_PLATFORMS) || github.event_name == 'push' && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
         include:
           - service: api-rs
             image: centaur-api-rs
@@ -123,20 +206,24 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure images
+        run: bash .github/scripts/configure-images.sh
+
       - name: Derive platform slug
         run: |
           platform="${{ matrix.platform }}"
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
 
       - name: Set up Depot
+        if: env.BUILD_BACKEND == 'depot'
         uses: depot/setup-action@91bc8495a33ebfc504ffc89e5674379ccf23c29c # v1.7.2
 
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.CENTAUR_REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.CENTAUR_REGISTRY_PASSWORD || (env.REGISTRY == 'ghcr.io' && secrets.GITHUB_TOKEN) || '' }}
 
       - name: Docker metadata for ${{ matrix.image }}
         id: meta
@@ -150,10 +237,32 @@ jobs:
           DOCKER_METADATA_PR_HEAD_SHA: true
 
       - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
-        id: build
+        id: depot-build
+        if: env.BUILD_BACKEND == 'depot'
         uses: depot/build-push-action@0f27be7c41d76663a98518dfe68f1c46582242c4 # v1.19.0
         with:
-          project: d8qqlh1bmq
+          project: ${{ inputs.depot_project || vars.CENTAUR_DEPOT_PROJECT || 'd8qqlh1bmq' }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Tags are applied by the merge job on the multi-arch manifest;
+          # per-arch builds are pushed by digest only. The fork check is also
+          # enforced at the job level so external PRs do not build.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ !github.event.pull_request.head.repo.fork }}
+          build-args: |
+            RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
+
+      - name: Set up Docker Buildx
+        if: env.BUILD_BACKEND == 'buildx'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
+        id: buildx-build
+        if: env.BUILD_BACKEND == 'buildx'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
@@ -168,9 +277,11 @@ jobs:
 
       - name: Export digest
         if: ${{ !github.event.pull_request.head.repo.fork }}
+        env:
+          DIGEST: ${{ steps.depot-build.outputs.digest || steps.buildx-build.outputs.digest }}
         run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="$DIGEST"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
@@ -183,7 +294,7 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ inputs.manifest_runner || vars.CENTAUR_MANIFEST_RUNNER || 'depot-ubuntu-24.04' }}
     needs: build
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
@@ -204,6 +315,14 @@ jobs:
           - image: centaur-teamsbot
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure images
+        run: bash .github/scripts/configure-images.sh
+
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -218,8 +337,8 @@ jobs:
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.CENTAUR_REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.CENTAUR_REGISTRY_PASSWORD || (env.REGISTRY == 'ghcr.io' && secrets.GITHUB_TOKEN) || '' }}
 
       - name: Docker metadata for ${{ matrix.image }}
         id: meta
@@ -244,14 +363,15 @@ jobs:
 
       - name: Create multi-arch manifest for ${{ matrix.image }}
         working-directory: ${{ runner.temp }}/digests
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}@sha256:%s ' *)
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/merge-images.sh"
 
       - name: Inspect manifest
-        run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE}:${VERSION}"
 
   # Runs the e2e scenarios against the images just published.
   e2e:
@@ -260,32 +380,39 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/e2e.yml
+    with:
+      registry: ${{ inputs.registry || vars.CENTAUR_REGISTRY || 'ghcr.io' }}
+      image_namespace: ${{ inputs.image_namespace || vars.CENTAUR_IMAGE_NAMESPACE || 'paradigmxyz/centaur' }}
+      runner: ${{ inputs.e2e_runner || vars.CENTAUR_E2E_RUNNER || 'depot-ubuntu-24.04-16' }}
 
   notify-centaur-paradigm:
     name: Notify Paradigm Overlay
     needs: merge
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: depot-ubuntu-24.04
-    environment: centaur-paradigm-dispatch
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && (inputs.dispatch_enabled || vars.CENTAUR_DISPATCH_ENABLED || 'true') != 'false'
+    runs-on: ${{ inputs.dispatch_runner || vars.CENTAUR_DISPATCH_RUNNER || 'depot-ubuntu-24.04' }}
+    environment: ${{ inputs.dispatch_environment || vars.CENTAUR_DISPATCH_ENVIRONMENT || 'centaur-paradigm-dispatch' }}
     permissions: {}
     steps:
       - name: Dispatch sandbox update
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.CENTAUR_PARADIGM_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.CENTAUR_DISPATCH_TOKEN || secrets.CENTAUR_PARADIGM_DISPATCH_TOKEN }}
+          DISPATCH_REPOSITORY: ${{ inputs.dispatch_repository || vars.CENTAUR_DISPATCH_REPOSITORY || 'paradigmxyz/centaur-paradigm' }}
+          DISPATCH_EVENT_TYPE: ${{ inputs.dispatch_event_type || vars.CENTAUR_DISPATCH_EVENT_TYPE || 'centaur-sandbox-published' }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "CENTAUR_PARADIGM_DISPATCH_TOKEN is required." >&2
+            echo "A dispatch token is required." >&2
             exit 1
           fi
 
           jq -n \
             --arg sha "$GITHUB_SHA" \
+            --arg event "$DISPATCH_EVENT_TYPE" \
             '{
-              event_type: "centaur-sandbox-published",
+              event_type: $event,
               client_payload: {sha: $sha}
             }' |
             gh api \
               --method POST \
-              repos/paradigmxyz/centaur-paradigm/dispatches \
+              "repos/${DISPATCH_REPOSITORY}/dispatches" \
               --input -

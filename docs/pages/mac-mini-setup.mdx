@@ -17,6 +17,10 @@ and importing images into k3s' container runtime.
 If you are evaluating on macOS, especially Apple Silicon, use the local-build
 path below. Native k3s is Linux-only, and published images are currently x86 only. In that case, build the images locally and load them into the local cluster runtime.
 
+For fork-owned registries, publishing credentials, builder/runner overrides, and
+public image selection, see [Image publishing and registries](/reference/image-publishing).
+Leaving these overrides unset preserves the existing publishing and local defaults.
+
 ## macOS local evaluation with kind
 
 This is the quickest reproducible laptop path when GHCR images do not match

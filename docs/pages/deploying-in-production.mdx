@@ -10,6 +10,10 @@ Postgres, sandbox pods for agent execution, and [iron-proxy](https://docs.iron.s
 injection. The goal is a small working deployment with a clear operator before
 you add more tools, workflows, harnesses, or overlays.
 
+For fork-owned registries, publishing credentials, builder/runner overrides, and
+public image selection, see [Image publishing and registries](/reference/image-publishing).
+Leaving these overrides unset preserves the existing publishing and local defaults.
+
 ## Production Shape
 
 The API saves threads, runs, and events in Postgres. The Kubernetes backend

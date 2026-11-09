@@ -28,6 +28,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source contrib/scripts/image-config.sh
+centaur_image_config
 
 CLUSTER="${CENTAUR_E2E_CLUSTER:-centaur-e2e}"
 RELEASE=centaur # contrib/scripts/bootstrap-k8s-secrets.sh assumes this name
@@ -90,29 +92,31 @@ up() {
     --dry-run=client -o yaml | apply_stdin
   kubectl -n kube-system rollout restart deploy/coredns > /dev/null
 
-  local image_args=() entry service key tag
+  local image_args=() entry service key tag image
   for entry in "${IMAGES[@]}"; do
     service="${entry%%:*}" key="${entry#*:}"
     if [[ -n "${CENTAUR_E2E_IMAGE_TAG:-}" ]]; then
       image_args+=(
-        --set "${key}.image.repository=ghcr.io/paradigmxyz/centaur/centaur-${service}"
-        --set "${key}.image.tag=${CENTAUR_E2E_IMAGE_TAG}"
+        --set-string "${key}.image.repository=${CENTAUR_REGISTRY}/${CENTAUR_IMAGE_NAMESPACE}/centaur-${service}"
+        --set-string "${key}.image.tag=${CENTAUR_E2E_IMAGE_TAG}"
       )
       # Pull the multi-GB agent image now, not inside a sandbox's ready timeout.
       if [[ "$service" == agent ]]; then
         docker exec "${CLUSTER}-control-plane" crictl pull \
-          "ghcr.io/paradigmxyz/centaur/centaur-agent:${CENTAUR_E2E_IMAGE_TAG}"
+          "${CENTAUR_REGISTRY}/${CENTAUR_IMAGE_NAMESPACE}/centaur-agent:${CENTAUR_E2E_IMAGE_TAG}"
       fi
     else
-      just build-one "$service"
+      CENTAUR_IMAGE_SOURCE=local just build-one "$service"
       # Tag by content so a rebuilt image changes the release values and Helm
       # rolls exactly the pods whose image changed.
-      tag="e2e-$(docker image inspect -f '{{.Id}}' "centaur-${service}:latest" | cut -c8-19)"
-      docker tag "centaur-${service}:latest" "centaur-${service}:${tag}"
+      image="centaur-${service}:latest"
+      if [[ "$service" == agent ]]; then image="${CENTAUR_AGENT_IMAGE:-$image}"; fi
+      tag="e2e-$(docker image inspect -f '{{.Id}}' "$image" | cut -c8-19)"
+      docker tag "$image" "centaur-${service}:${tag}"
       kind load docker-image --name "$CLUSTER" "centaur-${service}:${tag}"
       image_args+=(
-        --set "${key}.image.repository=centaur-${service}"
-        --set "${key}.image.tag=${tag}"
+        --set-string "${key}.image.repository=centaur-${service}"
+        --set-string "${key}.image.tag=${tag}"
       )
     fi
   done
